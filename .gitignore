@@ -1,0 +1,9 @@
+node_modules/
+client/node_modules/
+server/node_modules/
+client/dist/
+client/.env
+server/.env
+.DS_Store
+.claude/
+.qodo/
