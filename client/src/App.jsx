@@ -2,6 +2,7 @@ import { useState } from 'react'
 import Lobby from './pages/Lobby.jsx'
 import BrowseRooms from './pages/BrowseRooms.jsx'
 import Game from './pages/Game.jsx'
+import { getOrCreateWalletId } from './utils/wallet.js'
 
 const STARTING_CHIPS = 1500
 
@@ -21,6 +22,7 @@ export default function App() {
   const [roomData, setRoomData] = useState(null)
   const [myId, setMyId] = useState(null)
   const [pendingRoomCode] = useState(() => getDirectJoinCode())
+  const [walletId] = useState(() => getOrCreateWalletId())
 
   const saveChips = (amount) => {
     const safe = amount > 0 ? amount : STARTING_CHIPS
@@ -42,9 +44,11 @@ export default function App() {
   if (screen === 'browse') return (
     <BrowseRooms
       profile={profile}
+      walletId={walletId}
       setMyId={setMyId}
       setRoomData={setRoomData}
       setScreen={setScreen}
+      onChipsChange={saveChips}
       onBack={() => setScreen('lobby')}
       autoJoinCode={pendingRoomCode}
     />

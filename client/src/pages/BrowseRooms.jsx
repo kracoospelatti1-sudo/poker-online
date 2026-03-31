@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef } from 'react'
 import { socket } from '../socket.js'
+import { hasAppliedPayment, markPaymentApplied } from '../utils/wallet.js'
 
 const BLIND_LABELS = {
   'EASY01': { label: '🟢 Principiante', color: 'text-green-400', border: 'border-green-500/40', glow: 'rgba(34,197,94,0.15)' },
@@ -18,6 +19,7 @@ const PHASE_LABELS = {
 }
 
 const BASE_URL = window.location.origin
+const API_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001'
 
 function RoomCard({ room, profile, onJoin }) {
   const [copied, setCopied] = useState(false)
@@ -106,14 +108,92 @@ function RoomCard({ room, profile, onJoin }) {
   )
 }
 
-export default function BrowseRooms({ profile, setMyId, setRoomData, setScreen, onBack, autoJoinCode }) {
+export default function BrowseRooms({ profile, walletId, setMyId, setRoomData, setScreen, onChipsChange, onBack, autoJoinCode }) {
   const [rooms, setRooms] = useState([])
   const [joinCode, setJoinCode] = useState('')
   const [joining, setJoining] = useState(false)
   const [error, setError] = useState('')
+  const [paymentStatus, setPaymentStatus] = useState('')
+  const [coinPacks, setCoinPacks] = useState([])
+  const [buyingPackId, setBuyingPackId] = useState('')
   const [tab, setTab] = useState('default') // 'default' | 'private' | 'bots'
   const [botCount, setBotCount] = useState(3)
   const codeRef = useRef(null)
+  const getCurrentChips = () => {
+    const raw = parseInt(localStorage.getItem('poker_chips'), 10)
+    if (Number.isFinite(raw) && raw > 0) return raw
+    return profile.chips || 1500
+  }
+
+  useEffect(() => {
+    let cancelled = false
+    fetch(`${API_URL}/api/coin-packs`)
+      .then(r => r.json())
+      .then(data => {
+        if (cancelled) return
+        setCoinPacks(Array.isArray(data?.packs) ? data.packs : [])
+      })
+      .catch(() => {
+        if (cancelled) return
+        setCoinPacks([])
+      })
+    return () => { cancelled = true }
+  }, [])
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const mpStatus = params.get('mp_status')
+    const paymentId = params.get('payment_id')
+    const shouldCleanUrl = mpStatus || paymentId
+    if (!shouldCleanUrl) return
+
+    let cancelled = false
+    const cleanPaymentParamsFromUrl = () => {
+      const nextParams = new URLSearchParams(window.location.search)
+      ;['mp_status', 'payment_id', 'status', 'merchant_order_id', 'preference_id', 'collection_id', 'collection_status']
+        .forEach(k => nextParams.delete(k))
+      const nextSearch = nextParams.toString()
+      const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}`
+      window.history.replaceState({}, '', nextUrl)
+    }
+
+    const confirmPayment = async () => {
+      if (mpStatus !== 'success' || !paymentId) {
+        if (mpStatus === 'pending') setPaymentStatus('Pago pendiente. Cuando se apruebe, las fichas se acreditan.')
+        if (mpStatus === 'failure') setPaymentStatus('Pago no completado.')
+        cleanPaymentParamsFromUrl()
+        return
+      }
+
+      if (hasAppliedPayment(paymentId)) {
+        setPaymentStatus('Este pago ya estaba acreditado en este navegador.')
+        cleanPaymentParamsFromUrl()
+        return
+      }
+
+      try {
+        const response = await fetch(`${API_URL}/api/payments/confirm?payment_id=${encodeURIComponent(paymentId)}`)
+        const data = await response.json()
+        if (!response.ok) throw new Error(data?.error || 'No se pudo validar el pago')
+        if (data.walletId !== walletId) throw new Error('El pago pertenece a otra wallet')
+
+        const current = getCurrentChips()
+        const credited = Number(data.chips) || 0
+        if (credited > 0) {
+          onChipsChange(current + credited)
+          markPaymentApplied(paymentId)
+          if (!cancelled) setPaymentStatus(`Pago aprobado: +${credited.toLocaleString()} fichas.`)
+        }
+      } catch (e) {
+        if (!cancelled) setPaymentStatus(e?.message || 'No se pudo acreditar el pago.')
+      } finally {
+        cleanPaymentParamsFromUrl()
+      }
+    }
+
+    confirmPayment()
+    return () => { cancelled = true }
+  }, [walletId, onChipsChange])
 
   useEffect(() => {
     const onRoomList = (list) => setRooms(list)
@@ -184,6 +264,28 @@ export default function BrowseRooms({ profile, setMyId, setRoomData, setScreen, 
     })
   }
 
+  const handleBuyChips = async (packId) => {
+    if (!walletId || buyingPackId) return
+    setBuyingPackId(packId)
+    setPaymentStatus('')
+
+    try {
+      const response = await fetch(`${API_URL}/api/payments/create-preference`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ walletId, packId }),
+      })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data?.error || 'No se pudo iniciar el checkout')
+      const checkoutUrl = data.checkoutUrl || data.sandboxCheckoutUrl
+      if (!checkoutUrl) throw new Error('Mercado Pago no devolvio URL de checkout')
+      window.location.href = checkoutUrl
+    } catch (e) {
+      setPaymentStatus(e?.message || 'No se pudo iniciar la compra de fichas.')
+      setBuyingPackId('')
+    }
+  }
+
   const defaultRooms = rooms.filter(r => r.isDefault)
   const privateRooms = rooms.filter(r => !r.isDefault)
 
@@ -236,6 +338,42 @@ export default function BrowseRooms({ profile, setMyId, setRoomData, setScreen, 
       </div>
 
       <div className="flex-1 relative z-10 max-w-2xl mx-auto w-full px-4 py-6 space-y-6">
+
+        {/* Chip store */}
+        <div className="rounded-2xl border border-emerald-500/30 p-4 sm:p-5"
+          style={{ background: 'linear-gradient(135deg, rgba(6,78,59,0.22), rgba(4,120,87,0.15))' }}>
+          <div className="flex items-center justify-between gap-2 mb-3">
+            <div>
+              <h2 className="text-white font-black text-sm sm:text-base">Cargar fichas</h2>
+              <p className="text-emerald-200/70 text-xs">Checkout seguro con Mercado Pago</p>
+            </div>
+            <div className="text-emerald-300 text-xs font-mono">Wallet {walletId?.slice(0, 8)}</div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+            {coinPacks.map(pack => (
+              <button key={pack.id}
+                onClick={() => handleBuyChips(pack.id)}
+                disabled={!!buyingPackId}
+                className="rounded-xl border border-emerald-400/30 p-3 text-left transition-all hover:border-emerald-300 disabled:opacity-50 disabled:cursor-not-allowed"
+                style={{ background: 'rgba(255,255,255,0.04)' }}>
+                <div className="text-white font-bold text-sm">{pack.label}</div>
+                <div className="text-emerald-300 font-black text-base">{Number(pack.chips || 0).toLocaleString()} fichas</div>
+                <div className="text-emerald-200/80 text-xs mt-1">${Number(pack.price || 0).toLocaleString('es-AR')} {pack.currency || 'ARS'}</div>
+              </button>
+            ))}
+            {coinPacks.length === 0 && (
+              <div className="text-slate-400 text-sm py-2">No hay paquetes configurados.</div>
+            )}
+          </div>
+
+          {paymentStatus && (
+            <div className="mt-3 text-xs sm:text-sm rounded-lg border border-emerald-400/25 px-3 py-2 text-emerald-200"
+              style={{ background: 'rgba(16,185,129,0.08)' }}>
+              {paymentStatus}
+            </div>
+          )}
+        </div>
 
         {/* Tabs */}
         <div className="flex rounded-xl border border-slate-700/50 p-1 gap-1" style={{ background: 'rgba(17,24,39,0.8)' }}>

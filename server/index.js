@@ -1,12 +1,28 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
 const { createGameState, startHand, handleAction, STARTING_CHIPS } = require('./game/gameManager');
 const { createBots, decideBotAction } = require('./game/botPlayer');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
+app.use(express.json());
+
+const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
+const PUBLIC_SERVER_URL = process.env.PUBLIC_SERVER_URL || `http://localhost:${process.env.PORT || 3001}`;
+const MP_ACCESS_TOKEN = process.env.MERCADOPAGO_ACCESS_TOKEN || '';
+
+const COIN_PACKS = {
+  STARTER: { label: 'Paquete Starter', chips: 5000, price: 1500, currency: 'ARS' },
+  PRO: { label: 'Paquete Pro', chips: 15000, price: 3900, currency: 'ARS' },
+  HIGHROLLER: { label: 'Paquete High Roller', chips: 50000, price: 10900, currency: 'ARS' },
+};
+
+const mpClient = MP_ACCESS_TOKEN ? new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN }) : null;
+const paymentClient = mpClient ? new Payment(mpClient) : null;
+const preferenceClient = mpClient ? new Preference(mpClient) : null;
 
 const rooms = new Map();
 const TURN_SECONDS = 30;
@@ -19,6 +35,13 @@ const DEFAULT_TABLES = [
 ];
 
 const generateCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
+const makeExternalReference = (walletId, packId) => `${walletId}:${packId}`;
+const parseExternalReference = (value) => {
+  if (!value || typeof value !== 'string') return null;
+  const [walletId, packId] = value.split(':');
+  if (!walletId || !packId) return null;
+  return { walletId, packId: packId.toUpperCase() };
+};
 
 // ── Timer ──────────────────────────────────────────────────────────────────
 const clearRoomTimer = (room) => {
@@ -460,6 +483,126 @@ app.get('/', (_, res) => res.send('Poker Server OK'));
 app.get('/rooms', (_, res) => {
   const list = Array.from(rooms.values()).map(getRoomListItem);
   res.json(list);
+});
+
+app.get('/api/coin-packs', (_, res) => {
+  const packs = Object.entries(COIN_PACKS).map(([id, data]) => ({
+    id,
+    ...data,
+  }));
+  res.json({ packs });
+});
+
+app.post('/api/payments/create-preference', async (req, res) => {
+  try {
+    if (!preferenceClient) {
+      res.status(500).json({ error: 'Mercado Pago no esta configurado en el servidor.' });
+      return;
+    }
+
+    const walletId = String(req.body?.walletId || '').trim();
+    const packId = String(req.body?.packId || '').toUpperCase();
+    const pack = COIN_PACKS[packId];
+
+    if (!walletId || !/^[a-zA-Z0-9_-]{8,64}$/.test(walletId)) {
+      res.status(400).json({ error: 'walletId invalido.' });
+      return;
+    }
+    if (!pack) {
+      res.status(400).json({ error: 'Paquete invalido.' });
+      return;
+    }
+
+    const preference = await preferenceClient.create({
+      body: {
+        external_reference: makeExternalReference(walletId, packId),
+        metadata: { walletId, packId, chips: pack.chips },
+        items: [{
+          id: packId,
+          title: `${pack.label} (${pack.chips.toLocaleString('es-AR')} fichas)`,
+          quantity: 1,
+          unit_price: pack.price,
+          currency_id: pack.currency,
+        }],
+        back_urls: {
+          success: `${CLIENT_URL}/?mp_status=success`,
+          failure: `${CLIENT_URL}/?mp_status=failure`,
+          pending: `${CLIENT_URL}/?mp_status=pending`,
+        },
+        auto_return: 'approved',
+        notification_url: `${PUBLIC_SERVER_URL}/api/payments/webhook`,
+      }
+    });
+
+    res.json({
+      preferenceId: preference.id,
+      checkoutUrl: preference.init_point,
+      sandboxCheckoutUrl: preference.sandbox_init_point,
+    });
+  } catch (error) {
+    console.error('create-preference error', error?.message || error);
+    res.status(500).json({ error: 'No se pudo crear la preferencia de pago.' });
+  }
+});
+
+app.get('/api/payments/confirm', async (req, res) => {
+  try {
+    if (!paymentClient) {
+      res.status(500).json({ error: 'Mercado Pago no esta configurado en el servidor.' });
+      return;
+    }
+
+    const paymentId = Number(req.query.payment_id);
+    if (!Number.isFinite(paymentId) || paymentId <= 0) {
+      res.status(400).json({ error: 'payment_id invalido.' });
+      return;
+    }
+
+    const payment = await paymentClient.get({ id: paymentId });
+    const ref = parseExternalReference(payment.external_reference);
+    if (!ref) {
+      res.status(400).json({ error: 'No se encontro referencia de wallet en el pago.' });
+      return;
+    }
+
+    const pack = COIN_PACKS[ref.packId];
+    if (!pack) {
+      res.status(400).json({ error: 'Paquete no reconocido.' });
+      return;
+    }
+
+    if (payment.status !== 'approved') {
+      res.status(400).json({
+        error: 'El pago todavia no esta aprobado.',
+        status: payment.status,
+      });
+      return;
+    }
+
+    const txAmount = Number(payment.transaction_amount);
+    if (!Number.isFinite(txAmount) || txAmount < pack.price) {
+      res.status(400).json({ error: 'Monto de pago invalido.' });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      paymentId: payment.id,
+      walletId: ref.walletId,
+      packId: ref.packId,
+      chips: pack.chips,
+      status: payment.status,
+    });
+  } catch (error) {
+    console.error('confirm payment error', error?.message || error);
+    res.status(500).json({ error: 'No se pudo validar el pago.' });
+  }
+});
+
+app.post('/api/payments/webhook', (req, res) => {
+  // Webhook reservado para evolucion futura (auditoria/registro de pagos).
+  // El credito actual de fichas se valida en /api/payments/confirm con payment_id.
+  res.status(200).send('ok');
 });
 
 const PORT = process.env.PORT || 3001;
