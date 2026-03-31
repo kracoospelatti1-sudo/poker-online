@@ -1,4 +1,5 @@
 const express = require('express');
+const cors = require('cors');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
@@ -8,14 +9,49 @@ const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
 const { createGameState, startHand, handleAction, STARTING_CHIPS } = require('./game/gameManager');
 const { createBots, decideBotAction } = require('./game/botPlayer');
 
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
-app.use(express.json());
-
 const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
 const PUBLIC_SERVER_URL = process.env.PUBLIC_SERVER_URL || `http://localhost:${process.env.PORT || 3001}`;
 const MP_ACCESS_TOKEN = process.env.MERCADOPAGO_ACCESS_TOKEN || '';
+const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+
+const parseAllowedOrigins = () => {
+  const list = String(CORS_ORIGIN)
+    .split(',')
+    .map(v => v.trim())
+    .filter(Boolean);
+  if (list.length === 0) return ['*'];
+  return list;
+};
+
+const allowedOrigins = parseAllowedOrigins();
+const isOriginAllowed = (origin) => {
+  if (!origin) return true;
+  if (allowedOrigins.includes('*')) return true;
+  return allowedOrigins.includes(origin);
+};
+
+const corsOptions = {
+  origin(origin, callback) {
+    if (isOriginAllowed(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(new Error(`Origen no permitido por CORS: ${origin}`));
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+};
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: (origin, callback) => corsOptions.origin(origin, callback),
+    methods: corsOptions.methods,
+  }
+});
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+app.use(express.json());
 
 const COIN_PACKS = {
   STARTER: { label: 'Paquete Starter', chips: 5000, price: 1500, currency: 'ARS' },
