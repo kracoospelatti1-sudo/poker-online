@@ -1,5 +1,8 @@
 const express = require('express');
+const fs = require('fs');
 const http = require('http');
+const path = require('path');
+const crypto = require('crypto');
 const { Server } = require('socket.io');
 const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
 const { createGameState, startHand, handleAction, STARTING_CHIPS } = require('./game/gameManager');
@@ -23,8 +26,14 @@ const COIN_PACKS = {
 const mpClient = MP_ACCESS_TOKEN ? new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN }) : null;
 const paymentClient = mpClient ? new Payment(mpClient) : null;
 const preferenceClient = mpClient ? new Preference(mpClient) : null;
+const USERS_FILE_PATH = path.join(__dirname, 'data', 'users.json');
+const AUTH_TOKEN_TTL_MS = Number(process.env.AUTH_TOKEN_TTL_MS) || 1000 * 60 * 60 * 24 * 7;
+const BOOTSTRAP_ADMIN_USERNAME = String(process.env.ADMIN_USERNAME || 'admin').trim().toLowerCase();
+const BOOTSTRAP_ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || 'admin1234');
+const BOOTSTRAP_ADMIN_NAME = String(process.env.ADMIN_NAME || 'Administrador').trim() || 'Administrador';
 
 const rooms = new Map();
+const authSessions = new Map();
 const TURN_SECONDS = 30;
 
 const DEFAULT_TABLES = [
@@ -41,6 +50,169 @@ const parseExternalReference = (value) => {
   const [walletId, packId] = value.split(':');
   if (!walletId || !packId) return null;
   return { walletId, packId: packId.toUpperCase() };
+};
+
+const ensureUsersStorage = () => {
+  const dir = path.dirname(USERS_FILE_PATH);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  if (!fs.existsSync(USERS_FILE_PATH)) {
+    fs.writeFileSync(USERS_FILE_PATH, JSON.stringify({ users: [] }, null, 2), 'utf8');
+  }
+};
+
+const loadUsers = () => {
+  ensureUsersStorage();
+  try {
+    const raw = fs.readFileSync(USERS_FILE_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed?.users) ? parsed.users : [];
+  } catch (error) {
+    console.error('users load error', error?.message || error);
+    return [];
+  }
+};
+
+const persistUsers = (users) => {
+  ensureUsersStorage();
+  fs.writeFileSync(USERS_FILE_PATH, JSON.stringify({ users }, null, 2), 'utf8');
+};
+
+const normalizeUsername = (value) => String(value || '').trim().toLowerCase();
+const isValidUsername = (value) => /^[a-z0-9_.-]{3,32}$/.test(value);
+const isValidRole = (value) => value === 'admin' || value === 'player';
+
+const hashPassword = (password) => {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `${salt}:${hash}`;
+};
+
+const verifyPassword = (password, storedHash) => {
+  if (!storedHash || typeof storedHash !== 'string' || !storedHash.includes(':')) return false;
+  const [salt, expected] = storedHash.split(':');
+  const computed = crypto.scryptSync(password, salt, 64).toString('hex');
+  const expectedBuffer = Buffer.from(expected, 'hex');
+  const computedBuffer = Buffer.from(computed, 'hex');
+  if (expectedBuffer.length !== computedBuffer.length) return false;
+  return crypto.timingSafeEqual(expectedBuffer, computedBuffer);
+};
+
+const toPublicUser = (user) => ({
+  id: user.id,
+  username: user.username,
+  name: user.name,
+  role: user.role,
+  createdAt: user.createdAt,
+  createdBy: user.createdBy || null,
+});
+
+let users = loadUsers();
+
+const findUserByUsername = (username) => {
+  const normalized = normalizeUsername(username);
+  return users.find(u => u.username === normalized) || null;
+};
+
+const findUserById = (id) => users.find(u => u.id === id) || null;
+
+const createUser = ({ username, name, password, role = 'player', createdBy = null }) => {
+  const normalized = normalizeUsername(username);
+  const safeName = String(name || '').trim();
+  const safeRole = String(role || 'player').trim().toLowerCase();
+
+  if (!isValidUsername(normalized)) throw new Error('username_invalid');
+  if (password.length < 6 || password.length > 128) throw new Error('password_invalid');
+  if (!isValidRole(safeRole)) throw new Error('role_invalid');
+  if (findUserByUsername(normalized)) throw new Error('username_taken');
+
+  const user = {
+    id: `usr_${crypto.randomUUID()}`,
+    username: normalized,
+    name: safeName || normalized,
+    role: safeRole,
+    passwordHash: hashPassword(password),
+    createdAt: new Date().toISOString(),
+    createdBy,
+  };
+
+  users.push(user);
+  persistUsers(users);
+  return user;
+};
+
+const issueAuthToken = (userId) => {
+  const token = crypto.randomBytes(32).toString('hex');
+  authSessions.set(token, { userId, expiresAt: Date.now() + AUTH_TOKEN_TTL_MS });
+  return token;
+};
+
+const getSessionUser = (token) => {
+  const session = authSessions.get(token);
+  if (!session) return null;
+  if (session.expiresAt <= Date.now()) {
+    authSessions.delete(token);
+    return null;
+  }
+  return findUserById(session.userId);
+};
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, session] of authSessions.entries()) {
+    if (session.expiresAt <= now) authSessions.delete(token);
+  }
+}, 60000).unref();
+
+const requireAuth = (req, res, next) => {
+  const authHeader = String(req.headers.authorization || '');
+  if (!authHeader.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'Token requerido.' });
+    return;
+  }
+
+  const token = authHeader.slice(7).trim();
+  const user = getSessionUser(token);
+  if (!user) {
+    res.status(401).json({ error: 'Token invalido o expirado.' });
+    return;
+  }
+
+  req.authUser = user;
+  req.authToken = token;
+  next();
+};
+
+const requireAdmin = (req, res, next) => {
+  if (req.authUser?.role !== 'admin') {
+    res.status(403).json({ error: 'Permisos insuficientes.' });
+    return;
+  }
+  next();
+};
+
+const bootstrapAdmin = () => {
+  if (!isValidUsername(BOOTSTRAP_ADMIN_USERNAME)) {
+    console.warn('ADMIN_USERNAME invalido. Debe cumplir /^[a-z0-9_.-]{3,32}$/');
+    return;
+  }
+  if (BOOTSTRAP_ADMIN_PASSWORD.length < 6) {
+    console.warn('ADMIN_PASSWORD invalido. Debe tener al menos 6 caracteres.');
+    return;
+  }
+  if (findUserByUsername(BOOTSTRAP_ADMIN_USERNAME)) return;
+
+  createUser({
+    username: BOOTSTRAP_ADMIN_USERNAME,
+    name: BOOTSTRAP_ADMIN_NAME,
+    password: BOOTSTRAP_ADMIN_PASSWORD,
+    role: 'admin',
+    createdBy: null,
+  });
+
+  if (!process.env.ADMIN_PASSWORD) {
+    console.warn('Se creo admin por defecto: usuario "admin", password "admin1234". Configura ADMIN_PASSWORD.');
+  }
+  console.log(`Admin bootstrap listo: ${BOOTSTRAP_ADMIN_USERNAME}`);
 };
 
 // ── Timer ──────────────────────────────────────────────────────────────────
@@ -477,12 +649,95 @@ io.on('connection', (socket) => {
   });
 });
 
+bootstrapAdmin();
 initDefaultRooms();
 
 app.get('/', (_, res) => res.send('Poker Server OK'));
 app.get('/rooms', (_, res) => {
   const list = Array.from(rooms.values()).map(getRoomListItem);
   res.json(list);
+});
+
+app.post('/api/auth/login', (req, res) => {
+  const username = normalizeUsername(req.body?.username);
+  const password = String(req.body?.password || '');
+  const user = findUserByUsername(username);
+  if (!user || !verifyPassword(password, user.passwordHash)) {
+    res.status(401).json({ error: 'Credenciales invalidas.' });
+    return;
+  }
+
+  const token = issueAuthToken(user.id);
+  res.json({
+    token,
+    expiresInMs: AUTH_TOKEN_TTL_MS,
+    user: toPublicUser(user),
+  });
+});
+
+app.get('/api/auth/me', requireAuth, (req, res) => {
+  res.json({ user: toPublicUser(req.authUser) });
+});
+
+app.post('/api/auth/logout', requireAuth, (req, res) => {
+  authSessions.delete(req.authToken);
+  res.json({ ok: true });
+});
+
+app.get('/api/admin/users', requireAuth, requireAdmin, (_, res) => {
+  const list = users.map(toPublicUser);
+  res.json({ users: list });
+});
+
+app.post('/api/admin/users', requireAuth, requireAdmin, (req, res) => {
+  try {
+    const username = normalizeUsername(req.body?.username);
+    const password = String(req.body?.password || '');
+    const name = String(req.body?.name || '').trim();
+    const role = String(req.body?.role || 'player').trim().toLowerCase();
+
+    if (!isValidUsername(username)) {
+      res.status(400).json({ error: 'username invalido. Usa 3-32 chars: a-z, 0-9, _, ., -' });
+      return;
+    }
+    if (password.length < 6 || password.length > 128) {
+      res.status(400).json({ error: 'password invalido. Usa entre 6 y 128 caracteres.' });
+      return;
+    }
+    if (!isValidRole(role)) {
+      res.status(400).json({ error: 'role invalido. Valores permitidos: admin, player.' });
+      return;
+    }
+
+    const created = createUser({
+      username,
+      name,
+      password,
+      role,
+      createdBy: req.authUser.id,
+    });
+
+    res.status(201).json({ user: toPublicUser(created) });
+  } catch (error) {
+    if (error?.message === 'username_taken') {
+      res.status(409).json({ error: 'Ese username ya existe.' });
+      return;
+    }
+    if (error?.message === 'username_invalid') {
+      res.status(400).json({ error: 'username invalido.' });
+      return;
+    }
+    if (error?.message === 'password_invalid') {
+      res.status(400).json({ error: 'password invalido.' });
+      return;
+    }
+    if (error?.message === 'role_invalid') {
+      res.status(400).json({ error: 'role invalido.' });
+      return;
+    }
+    console.error('admin create user error', error?.message || error);
+    res.status(500).json({ error: 'No se pudo crear la cuenta.' });
+  }
 });
 
 app.get('/api/coin-packs', (_, res) => {

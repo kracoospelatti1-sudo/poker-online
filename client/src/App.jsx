@@ -2,9 +2,12 @@ import { useState } from 'react'
 import Lobby from './pages/Lobby.jsx'
 import BrowseRooms from './pages/BrowseRooms.jsx'
 import Game from './pages/Game.jsx'
+import Auth from './pages/Auth.jsx'
+import AdminPanel from './pages/AdminPanel.jsx'
 import { getOrCreateWalletId } from './utils/wallet.js'
 
 const STARTING_CHIPS = 1500
+const API_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001'
 
 function getStoredChips() {
   const v = parseInt(localStorage.getItem('poker_chips'), 10)
@@ -18,6 +21,7 @@ function getDirectJoinCode() {
 
 export default function App() {
   const [screen, setScreen] = useState('lobby')
+  const [auth, setAuth] = useState(null) // { token, user }
   const [profile, setProfile] = useState(null)  // { name, emoji, chips }
   const [roomData, setRoomData] = useState(null)
   const [myId, setMyId] = useState(null)
@@ -30,8 +34,49 @@ export default function App() {
     setProfile(prev => prev ? { ...prev, chips: safe } : prev)
   }
 
+  const handleAuthSuccess = ({ token, user }) => {
+    setAuth({ token, user })
+    setProfile(null)
+    setRoomData(null)
+    setMyId(null)
+    setScreen(user?.role === 'admin' ? 'admin' : 'lobby')
+  }
+
+  const handleLogout = async () => {
+    const currentToken = auth?.token
+    if (currentToken) {
+      try {
+        await fetch(`${API_URL}/api/auth/logout`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${currentToken}` },
+        })
+      } catch {
+        // Logout best-effort; local cleanup still proceeds.
+      }
+    }
+    setAuth(null)
+    setProfile(null)
+    setRoomData(null)
+    setMyId(null)
+    setScreen('lobby')
+  }
+
+  if (!auth) return (
+    <Auth onAuthSuccess={handleAuthSuccess} />
+  )
+
+  if (screen === 'admin') return (
+    <AdminPanel
+      auth={auth}
+      onContinue={() => setScreen('lobby')}
+      onLogout={handleLogout}
+    />
+  )
+
   if (screen === 'lobby') return (
     <Lobby
+      initialName={auth?.user?.name || auth?.user?.username || ''}
+      onLogout={handleLogout}
       pendingRoomCode={pendingRoomCode}
       onProfileSet={(p) => {
         const chips = getStoredChips()

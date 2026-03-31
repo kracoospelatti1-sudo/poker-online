@@ -27,8 +27,8 @@ function CoinIcon({ size = 32 }) {
   )
 }
 
-export default function Lobby({ onProfileSet, pendingRoomCode }) {
-  const [name, setName] = useState('')
+export default function Lobby({ onProfileSet, pendingRoomCode, initialName = '', onLogout }) {
+  const [name, setName] = useState(initialName.slice(0, 16))
   const [emoji, setEmoji] = useState(EMOJIS[0])
   const [error, setError] = useState('')
 
@@ -70,6 +70,17 @@ export default function Lobby({ onProfileSet, pendingRoomCode }) {
       </div>
 
       <div className="w-full max-w-sm relative z-10">
+        {typeof onLogout === 'function' && (
+          <div className="flex justify-end mb-3">
+            <button
+              onClick={onLogout}
+              className="text-xs font-bold px-3 py-1.5 rounded-lg border text-slate-300 border-white/15 hover:text-white hover:border-white/30 transition-colors"
+              style={{ background: 'rgba(255,255,255,0.04)' }}
+            >
+              Cerrar sesion
+            </button>
+          </div>
+        )}
 
         {/* Header */}
         <div className="text-center mb-8">

@@ -4,6 +4,7 @@ server/node_modules/
 client/dist/
 client/.env
 server/.env
+server/data/users.json
 .DS_Store
 .claude/
 .qodo/
